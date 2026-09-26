@@ -88,9 +88,41 @@ test('handleBridgeReceipt: Clears state on ok === true', () => {
   assert.strictEqual(logic.getStoredGrantState(storage), null);
 });
 
+test('handleBridgeReceipt: a rewards.deliver record the console accepted is success', () => {
+  for (const status of ['pending', 'processing', 'delivered']) {
+    const storage = new MockStorage();
+    const initial = logic.determineActionAndState(null, { playerId: '123', itemId: 'Sword', quantity: 1, quality: 0 }, crypto);
+    logic.setStoredGrantState(initial.newState, storage);
+    const outcome = logic.handleBridgeReceipt({ requestId: initial.newState.id, status }, initial.newState, storage);
+    assert.strictEqual(outcome.success, true, status);
+    assert.strictEqual(logic.getStoredGrantState(storage), null, status);
+  }
+});
+
+test('handleBridgeReceipt: a failed delivery is a permanent rejection, not uncertain', () => {
+  const storage = new MockStorage();
+  const initial = logic.determineActionAndState(null, { playerId: '123', itemId: 'Sword', quantity: 1, quality: 0 }, crypto);
+  logic.setStoredGrantState(initial.newState, storage);
+  const outcome = logic.handleBridgeReceipt({ status: 'failed', lastError: 'Player not found.' }, initial.newState, storage);
+  assert.strictEqual(outcome.success, false);
+  assert.strictEqual(outcome.permanent, true);
+  assert.strictEqual(outcome.message, 'Player not found.');
+  assert.strictEqual(logic.getStoredGrantState(storage), null);
+});
+
+test('handleBridgeReceipt: an uncertain delivery keeps the request ID', () => {
+  const storage = new MockStorage();
+  const initial = logic.determineActionAndState(null, { playerId: '123', itemId: 'Sword', quantity: 1, quality: 0, containerId: '99' }, crypto);
+  logic.setStoredGrantState(initial.newState, storage);
+  const outcome = logic.handleBridgeReceipt({ status: 'uncertain' }, initial.newState, storage);
+  assert.strictEqual(outcome.success, false);
+  assert.strictEqual(logic.getStoredGrantState(storage).status, 'UNCERTAIN');
+});
+
 test('handleBridgeReceipt: Transitions to UNCERTAIN on lost/failed response', () => {
   const storage = new MockStorage();
-  const payload = { playerId: '123', itemId: 'Sword', quantity: 1, quality: 0 };
+  // A stored grant is only valid with the container it targets.
+  const payload = { playerId: '123', itemId: 'Sword', quantity: 1, quality: 0, containerId: '99' };
   const initial = logic.determineActionAndState(null, payload, crypto);
   logic.setStoredGrantState(initial.newState, storage);
   

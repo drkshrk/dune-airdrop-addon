@@ -1,4 +1,0 @@
-node_modules
-*.test.js
-*.unit.test.js
-debug_idempotency.js

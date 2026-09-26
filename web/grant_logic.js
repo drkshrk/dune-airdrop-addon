@@ -86,20 +86,33 @@ function determineActionAndState(currentState, newPayload, cryptoObj) {
   }
 }
 
+// rewards.deliver answers with the console's delivery record. Once a record
+// is pending, processing or delivered the console owns the reward: it waits
+// for the player to be online and never repeats the same requestId.
+const ACCEPTED_DELIVERY_STATUSES = ['pending', 'processing', 'delivered'];
+
 function handleBridgeReceipt(receipt, currentState, storage) {
-  if (receipt && receipt.ok === true) {
-    // Success - clear state
+  const status = receipt && typeof receipt.status === 'string' ? receipt.status : null;
+  if ((receipt && receipt.ok === true) || ACCEPTED_DELIVERY_STATUSES.includes(status)) {
     clearStoredGrantState(storage);
-    return { success: true, message: 'Spawned successfully' };
-  } else {
-    // E.g. bridge error or duplicate: true but ok is false.
-    // Transition to uncertain state so we don't double-grant.
-    if (currentState) {
-      currentState.status = 'UNCERTAIN';
-      setStoredGrantState(currentState, storage);
-    }
-    return { success: false, message: 'Delivery outcome uncertain. Retained request ID.' };
+    return {
+      success: true,
+      message: status === 'pending' ? 'Queued: delivered when the player is online' : 'Delivered'
+    };
   }
+  if (status === 'failed') {
+    // The console tried and rejected it; retrying the same requestId returns
+    // the same failure, so there is nothing uncertain to keep.
+    clearStoredGrantState(storage);
+    return { success: false, permanent: true, message: receipt.lastError || 'The console rejected this delivery.' };
+  }
+  // No record, or the console itself reports the outcome as uncertain:
+  // keep the request ID so a retry can never grant twice.
+  if (currentState) {
+    currentState.status = 'UNCERTAIN';
+    setStoredGrantState(currentState, storage);
+  }
+  return { success: false, message: 'Delivery outcome uncertain. Retained request ID.' };
 }
 
 function handlePermanentRejection(currentState, storage) {

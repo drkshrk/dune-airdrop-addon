@@ -174,15 +174,13 @@ let sqlOutput = `-- ==========================================
 -- DO NOT EDIT THIS BLOCK MANUALLY
 -- ==========================================\n\n`;
 
-sqlOutput += `CREATE TABLE IF NOT EXISTS dune_airdrop.loot_tables (
-  tier INT,
-  category TEXT,
-  template_id TEXT,
-  weight INT,
-  UNIQUE(tier, category, template_id)
-);\n\n`;
+// The table is created by the main script; the pool is replaced wholesale so
+// a regenerated item list never leaves stale rows behind.
+sqlOutput += `TRUNCATE dune_airdrop.airdrop_loot_table;
 
-sqlOutput += `INSERT INTO dune_airdrop.loot_tables (tier, category, template_id, weight) VALUES\n`;
+`;
+
+sqlOutput += `INSERT INTO dune_airdrop.airdrop_loot_table (tier, category, template_id, weight) VALUES\n`;
 
 const valuesList = [];
 
@@ -215,7 +213,7 @@ for (let t = 0; t <= 6; t++) {
 
 // Add fallback values in case something breaks
 if (valuesList.length === 0) {
-  valuesList.push(`(0, 'resources', 'ScrapMetal', 100)`);
+  valuesList.push(`(0, 'raw_resources', 'ScrapMetal', 100)`);
 }
 
 sqlOutput += valuesList.join(',\n') + '\nON CONFLICT (tier, category, template_id) DO NOTHING;\n\n';

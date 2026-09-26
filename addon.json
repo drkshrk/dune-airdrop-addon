@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "dune-airdrop-addon",
   "name": "Airdrop Manager",
-  "description": "Standalone manager for playtime, daily streak, and weekly attendance-based G0 instant airdrops. WARNING: Automated airdrops require manually running a companion daemon container with the repository .env, host networking, scripts, and a Docker socket mount (which permits privileged Docker API operations).",
+  "description": "Playtime, daily streak and weekly attendance airdrops for Dune Docker. Rewards are tracked in the addon's own dune_airdrop database schema and delivered through the console's reward runtime (no companion daemon or Docker socket needed).",
   "author": "atobo",
-  "version": "1.3.7",
+  "version": "1.4.0",
   "type": "ui",
   "entry": {
     "navigation": "Airdrop Manager",
@@ -13,6 +13,7 @@
   "permissions": [
     "database:read",
     "database:write",
-    "admin:grant-items"
+    "rewards:grant",
+    "files:addon-data"
   ]
 }

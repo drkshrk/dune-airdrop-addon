@@ -26,10 +26,7 @@ mkdir -p dist
 python3 scripts/create_zip.py "dist/${PACKAGE_NAME}" \
   addon.json assets/dune_airdrop_art.png \
   web/addon.css web/addon.js web/dune-addon-bridge.js \
-  web/grant_logic.js web/index.html web/style.css \
-  daemon/.dockerignore daemon/Dockerfile daemon/README.md \
-  daemon/index.js daemon/databaseConfig.js daemon/deliveryResult.js \
-  daemon/package.json daemon/package-lock.json \
+  web/grant_logic.js web/outbox_drain.js web/index.html web/style.css \
   setup_playtime_airdrops.sql uninstall_playtime_airdrops.sql README.md
 
 echo "Created: dist/${PACKAGE_NAME}"

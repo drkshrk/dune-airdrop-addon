@@ -39,6 +39,10 @@ let activeContainerId = null;
 // Determine if running inside the Dune Docker Console iframe
 const isSandboxMode = window.parent === window;
 
+// Database layout this page expects (dune_airdrop.airdrop_schema_version).
+const SCHEMA_VERSION = 2;
+const DELIVERY_INTERVAL_MS = 30000;
+
 // --- Initialize Bridge & UI ---
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -51,21 +55,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         showToast('Mock: Queue cleared!', 'success');
         return;
       }
-      const pendingCount = pendingAirdropsData.length;
-      if (pendingCount === 0) {
-        showToast('There are no pending airdrops to clear.', 'warning');
+      const waiting = pendingAirdropsData.filter((d) => d.source === 'addon').length;
+      if (waiting === 0) {
+        showToast('Nothing is waiting in the addon queue. Rewards already handed to the console cannot be cleared here.', 'warning');
         return;
       }
       const confirmed = window.confirm(
-        `Clear ${pendingCount} pending airdrop${pendingCount === 1 ? '' : 's'}? ` +
-        'These rewards have not been confirmed as delivered and cannot be restored from this screen.'
+        `Discard ${waiting} reward${waiting === 1 ? '' : 's'} not yet handed to the console? ` +
+        'Rewards the console is already delivering are not affected.'
       );
       if (!confirmed) return;
       try {
+        const { watermark } = await readWatermark(window.DuneAddon.request);
         await window.DuneAddon.request("database.execute", {
-          query: 'DELETE FROM dune_airdrop.pending_deliveries WHERE is_applied = false'
+          query: discardQuery('queued', watermark)
         });
-        showToast('Pending airdrop queue cleared!', 'success');
+        showToast('Queued rewards discarded.', 'success');
         fetchPendingAirdrops();
       } catch (err) {
         showToast(`Failed to clear queue: ${err.message}`, 'error');
@@ -87,9 +92,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       await fetchDiagnostics();
       await fetchPendingAirdrops();
       await fetchContainers();
+      await loadMigrationReport();
+      setupMigrationActions();
 
       window.__fetchDiagnosticsInterval = setInterval(fetchDiagnostics, 5000);
       window.__fetchPendingInterval = setInterval(fetchPendingAirdrops, 5000);
+      runDeliveryCycle();
+      window.__deliveryInterval = setInterval(runDeliveryCycle, DELIVERY_INTERVAL_MS);
     } else {
       connectionStatusBadge.textContent = 'Setup Required';
       connectionStatusBadge.className = connectionStatusBadge.className.replace(
@@ -306,9 +315,13 @@ function setupSpawnModal() {
       }
       const qNum = qty;
 
-      // Resolve actId to FLS account_id securely with bigint cast
+      // The container's owner is recorded on the actor that holds the inventory.
       const res = await window.DuneAddon.request("database.query", {
-        query: `SELECT account_id FROM dune.inventories WHERE id = ${actId}::bigint LIMIT 1`
+        query: `SELECT a.owner_account_id::text AS account_id
+                  FROM dune.inventories i
+                  JOIN dune.actors a ON a.id = i.actor_id
+                 WHERE i.id = ${actId}::bigint
+                 LIMIT 1`
       });
 
       const account_id = (res.rows && res.rows.length === 1 && res.rows[0] && res.rows[0].account_id) ? String(res.rows[0].account_id) : null;
@@ -338,17 +351,23 @@ function setupSpawnModal() {
       // Persist pending/uncertain state before calling bridge
       setStoredGrantState(stateDecision.newState, window.localStorage);
 
-      const payload = {
-        ...stateDecision.newState.payload,
-        requestId: stateDecision.newState.id
-      };
-
-      const receipt = await window.DuneAddon.request("admin.items.grant", payload);
+      const stored = stateDecision.newState.payload;
+      const receipt = await window.DuneAddon.request("rewards.deliver", {
+        requestId: stateDecision.newState.id,
+        playerId: stored.playerId,
+        type: 'item',
+        itemId: stored.itemId,
+        amount: stored.quantity,
+        quality: stored.quality
+      });
 
       const outcome = handleBridgeReceipt(receipt, stateDecision.newState, window.localStorage);
 
-      if (outcome.success) {
-        showToast(`Successfully spawned ${qNum}x ${templateId}`, 'success');
+      if (outcome.permanent) {
+        updateUncertainStateUI(false);
+        showToast(`Grant rejected: ${outcome.message}`, 'error');
+      } else if (outcome.success) {
+        showToast(`${qNum}x ${templateId}: ${outcome.message}`, 'success');
         updateUncertainStateUI(false);
         if (window.selectContainer) {
           await window.selectContainer(actId);
@@ -388,14 +407,14 @@ function setupSpawnModal() {
 async function isAirdropSchemaReady() {
   try {
     const rawResult = await window.DuneAddon.request("database.query", {
-      query: `SELECT
-                to_regclass('dune_airdrop.config')::text AS config_table,
-                to_regclass('dune_airdrop.active_playtime')::text AS playtime_table,
-                to_regclass('dune_airdrop.pending_deliveries')::text AS queue_table`
+      query: `SELECT to_regclass('dune_airdrop.airdrop_schema_version')::text AS version_table`
     });
-    const rows = rawResult.rows || rawResult || [];
-    const row = rows[0] || {};
-    return Boolean(row.config_table && row.playtime_table && row.queue_table);
+    const row = (rawResult.rows || [])[0] || {};
+    if (!row.version_table) return false;
+    const version = await window.DuneAddon.request("database.query", {
+      query: 'SELECT max(version) AS version FROM dune_airdrop.airdrop_schema_version'
+    });
+    return Number(((version.rows || [])[0] || {}).version) >= SCHEMA_VERSION;
   } catch (err) {
     showToast(`Failed to check database setup: ${err.message}`, 'error');
     return false;
@@ -405,9 +424,10 @@ async function isAirdropSchemaReady() {
 async function loadSettings() {
   try {
     const rawRes = await window.DuneAddon.request("database.query", {
-      query: "SELECT config_value FROM dune_airdrop.config WHERE config_key = 'airdrop_multipliers' LIMIT 1"
+      query: "SELECT config_key, config_value FROM dune_airdrop.airdrop_config"
     });
-    const res = rawRes.rows || rawRes || [];
+    const configRows = rawRes.rows || [];
+    const configValue = (key) => (configRows.find((r) => r.config_key === key) || {}).config_value;
 
     let mults = {
       playtime_enabled: true,
@@ -419,11 +439,10 @@ async function loadSettings() {
       daily_max_streak: 7,
       weekly_enabled: true,
       weekly_days_required: 5,
-      weekly_multiplier: 5.0,
-      daemon_enabled: true
+      weekly_multiplier: 5.0
     };
-    if (res && res.length > 0 && res[0].config_value) {
-      mults = { ...mults, ...res[0].config_value };
+    if (configValue('airdrop_multipliers')) {
+      mults = { ...mults, ...configValue('airdrop_multipliers') };
     }
 
     // Load playtime inputs
@@ -434,10 +453,6 @@ async function loadSettings() {
     playtimeDistanceSlider.value = mults.playtime_distance !== undefined ? mults.playtime_distance : 10.0;
     playtimeXpInput.value = mults.playtime_xp !== undefined ? mults.playtime_xp : 1;
     playtimeXpSlider.value = mults.playtime_xp !== undefined ? mults.playtime_xp : 1;
-    const daemonToggle = document.getElementById('daemonEnabledToggle');
-    if (daemonToggle) {
-      daemonToggle.checked = mults.daemon_enabled !== undefined ? mults.daemon_enabled : true;
-    }
 
     // Load Daily inputs
     document.getElementById('dailyEnabledToggle').checked = mults.daily_enabled !== undefined ? mults.daily_enabled : true;
@@ -454,10 +469,6 @@ async function loadSettings() {
     document.getElementById('weeklyMultiplierSlider').value = mults.weekly_multiplier !== undefined ? mults.weekly_multiplier : 5.0;
 
 
-    const rawResEcon = await window.DuneAddon.request("database.query", {
-      query: "SELECT config_value FROM dune_airdrop.config WHERE config_key = 'airdrop_economy' LIMIT 1"
-    });
-    const resEcon = rawResEcon.rows || rawResEcon || [];
     let econ = {
       prob_gear: 0.40, prob_schem: 0.80, prob_raw: 1.0, prob_craft: 1.0, min_items: 1,
       tier_0_min: 5, tier_0_max: 10,
@@ -468,8 +479,8 @@ async function loadSettings() {
       tier_5_min: 30, tier_5_max: 75,
       tier_6_min: 50, tier_6_max: 100
     };
-    if (resEcon && resEcon.length > 0 && resEcon[0].config_value) {
-      econ = { ...econ, ...resEcon[0].config_value };
+    if (configValue('airdrop_economy')) {
+      econ = { ...econ, ...configValue('airdrop_economy') };
     }
 
     // Load Economy inputs
@@ -526,15 +537,13 @@ async function handleSaveAllSettings() {
       daily_max_streak: getInt(document.getElementById('dailyMaxStreakInput').value, 7),
       weekly_enabled: document.getElementById('weeklyEnabledToggle').checked,
       weekly_days_required: getInt(document.getElementById('weeklyDaysRequiredInput').value, 5),
-      weekly_multiplier: getFloat(document.getElementById('weeklyMultiplierInput').value, 5.0),
-      daemon_enabled: document.getElementById('daemonEnabledToggle') ? document.getElementById('daemonEnabledToggle').checked : true
+      weekly_multiplier: getFloat(document.getElementById('weeklyMultiplierInput').value, 5.0)
     };
 
     for (let t = 0; t <= 6; t++) {
       const input = document.getElementById(`playtimeMultiplierT${t}Input`);
       payload[`playtime_multiplier_t${t}`] = input ? getInt(input.value, 1) : 1;
     }
-    payload.playtime_multiplier = payload.playtime_multiplier_t6;
 
 
     const econPayload = {
@@ -549,21 +558,15 @@ async function handleSaveAllSettings() {
       econPayload[`tier_${t}_max`] = getInt(document.getElementById(`t${t}MaxInput`).value, 1);
     }
 
+    // One statement, so the console takes one pre-write backup per save.
     const escapedEconJson = JSON.stringify(econPayload).replace(/'/g, "''");
-    await window.DuneAddon.request("database.execute", {
-      query: `INSERT INTO dune_airdrop.config (config_key, config_value)
-              VALUES ('airdrop_economy', '${escapedEconJson}'::jsonb)
-              ON CONFLICT (config_key)
-              DO UPDATE SET config_value = EXCLUDED.config_value`
-    });
-
-    // 1. Save Airdrops Config
     const escapedJson = JSON.stringify(payload).replace(/'/g, "''");
     await window.DuneAddon.request("database.execute", {
-      query: `INSERT INTO dune_airdrop.config (config_key, config_value)
-              VALUES ('airdrop_multipliers', '${escapedJson}'::jsonb)
+      query: `INSERT INTO dune_airdrop.airdrop_config (config_key, config_value, updated_at)
+              VALUES ('airdrop_multipliers', '${escapedJson}'::jsonb, now()),
+                     ('airdrop_economy', '${escapedEconJson}'::jsonb, now())
               ON CONFLICT (config_key)
-              DO UPDATE SET config_value = EXCLUDED.config_value`
+              DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = now()`
     });
 
     showToast('All multipliers and settings saved successfully!', 'success');
@@ -592,16 +595,21 @@ async function handleInitializeSchema() {
     const sqlQuery = await response.text();
 
     showToast('Executing schema creation... This may take a moment.', 'success');
-    await window.DuneAddon.request("database.execute", {
+    const setupResult = await window.DuneAddon.request("database.execute", {
       query: sqlQuery
     });
-
-    showToast('Database schema and triggers initialized successfully. Reloading...', 'success');
+    const summary = ((setupResult && setupResult.rows) || [])[0] || {};
+    const held = Number(summary.legacy_rewards_held || 0) + Number(summary.legacy_rewards_for_review || 0);
+    showToast(held > 0
+      ? `Database ready. ${held} reward(s) from the previous version are held for your review. Reloading...`
+      : 'Database ready. Reloading...', 'success');
     window.setTimeout(() => window.location.reload(), 500);
   } catch (err) {
     const message = String(err?.message || err);
     if (/lock timeout|statement timeout|canceling statement/i.test(message)) {
       showToast('Schema init could not lock the active player-state table. Stop the battlegroup, then click INIT SCHEMA again.', 'error');
+    } else if (/daemon is still running/i.test(message)) {
+      showToast('The old airdrop daemon is still running. Remove it with: docker rm -f airdrop-daemon, then click INIT SCHEMA again.', 'error');
     } else {
       showToast(`Schema init failed: ${message}`, 'error');
     }
@@ -622,7 +630,7 @@ async function fetchDiagnostics() {
                 COALESCE(bp.weekly_login_mask, 0) AS weekly_login_mask
               FROM dune.player_state ps
               LEFT JOIN dune.actors act ON ps.player_pawn_id = act.id
-              LEFT JOIN dune_airdrop.active_playtime bp ON ps.player_pawn_id = bp.character_id::bigint
+              LEFT JOIN dune_airdrop.airdrop_player_progress bp ON ps.player_pawn_id = bp.character_id
               WHERE ps.player_pawn_id IS NOT NULL AND LOWER(ps.online_status::text) = 'online'`
     });
     const players = rawPlayers.rows || rawPlayers || [];
@@ -670,31 +678,64 @@ async function fetchPendingAirdrops() {
   if (isSandboxMode) return;
 
   try {
+    const { watermark } = await readWatermark(window.DuneAddon.request);
     const rawList = await window.DuneAddon.request("database.query", {
-      query: `SELECT bpd.id, COALESCE(ps.character_name, 'Unknown') as character_name, bpd.template_id, bpd.stack_size
-              FROM dune_airdrop.pending_deliveries bpd
-              LEFT JOIN dune.player_state ps ON bpd.account_id = ps.account_id
-              WHERE bpd.is_applied = false
-              ORDER BY bpd.created_at DESC`
+      query: `SELECT q.id::text AS id, 'airdrop:' || q.request_id::text AS request_id,
+                     COALESCE(ps.character_name, 'Unknown') AS character_name,
+                     q.template_id, q.stack_size, q.state
+                FROM dune_airdrop.airdrop_reward_queue q
+                LEFT JOIN dune.player_state ps ON ps.account_id = q.account_id
+               WHERE q.state IN ('queued', 'held', 'review')
+               ORDER BY q.created_at DESC
+               LIMIT 200`
     });
-    const list = rawList.rows || rawList || [];
+    const queueRows = rawList.rows || [];
+    const names = new Map(queueRows.map((r) => [r.request_id, r.character_name]));
 
-    pendingAirdropsData = list || [];
+    // Rewards past the watermark belong to the console now; show its view.
+    const consoleRows = [];
+    for (const status of ['pending', 'uncertain', 'failed']) {
+      const listed = await window.DuneAddon.request("rewards.list", { status, limit: 100 });
+      for (const d of (Array.isArray(listed) ? listed : (listed && listed.rows) || [])) {
+        const delivery = d.delivery || {};
+        consoleRows.push({
+          source: 'console',
+          character_name: names.get(d.requestId) || `Player ${delivery.playerId || '?'}`,
+          template_id: delivery.itemId || delivery.type || '?',
+          stack_size: delivery.amount || 1,
+          status: status === 'pending' ? 'waiting for player' : status,
+          detail: d.lastError || ''
+        });
+      }
+    }
+
+    const addonRows = queueRows
+      .filter((r) => r.state !== 'queued' || BigInt(r.id) > BigInt(watermark))
+      .map((r) => ({
+        source: r.state === 'queued' ? 'addon' : 'legacy',
+        character_name: r.character_name,
+        template_id: r.template_id,
+        stack_size: r.stack_size,
+        status: r.state === 'queued' ? 'queued' : (r.state === 'held' ? 'held (upgrade)' : 'uncertain (upgrade)'),
+        detail: ''
+      }));
+
+    pendingAirdropsData = [...addonRows, ...consoleRows];
     renderPendingAirdrops();
 
     // Populate filter dropdown
     const selected = airdropPlayerSelect.value;
-    const names = [...new Set(pendingAirdropsData.map(d => d.character_name))].sort();
+    const characterNames = [...new Set(pendingAirdropsData.map(d => d.character_name))].sort();
     airdropPlayerSelect.innerHTML = '<option value="all">All Characters</option>' +
-      names.map(n => `<option value="${escapeHTML(n)}">${escapeHTML(n)}</option>`).join('');
-    if (names.includes(selected) || selected === 'all') {
+      characterNames.map(n => `<option value="${escapeHTML(n)}">${escapeHTML(n)}</option>`).join('');
+    if (characterNames.includes(selected) || selected === 'all') {
       airdropPlayerSelect.value = selected;
     }
   } catch (err) {
     console.error('Failed to load pending queue:', err);
     pendingAirdropsTableBody.innerHTML = `
       <tr>
-        <td colspan="3" class="py-4 text-center italic text-rose-500">Error: ${escapeHTML(err.message || String(err))}</td>
+        <td colspan="4" class="py-4 text-center italic text-rose-500">Error: ${escapeHTML(err.message || String(err))}</td>
       </tr>
     `;
   }
@@ -709,7 +750,7 @@ function renderPendingAirdrops() {
   if (filtered.length === 0) {
     pendingAirdropsTableBody.innerHTML = `
       <tr>
-        <td colspan="3" class="py-2 text-center italic text-slate-500">No pending airdrops.</td>
+        <td colspan="4" class="py-2 text-center italic text-slate-500">No pending airdrops.</td>
       </tr>
     `;
     return;
@@ -719,9 +760,89 @@ function renderPendingAirdrops() {
     <tr class="border-b border-slate-900/40 hover:bg-slate-900/20 font-mono text-xs">
       <td class="py-1.5 text-slate-300">${escapeHTML(d.character_name)}</td>
       <td class="py-1.5 text-amber-500 font-bold">${escapeHTML(d.template_id)}</td>
-      <td class="py-1.5 text-right text-slate-300 font-bold">${d.stack_size}</td>
+      <td class="py-1.5 text-right text-slate-300 font-bold">${escapeHTML(d.stack_size)}</td>
+      <td class="py-1.5 text-right text-slate-400" title="${escapeHTML(d.detail)}">${escapeHTML(d.status)}</td>
     </tr>
   `).join('');
+}
+
+// --- Delivery: hand queued rewards to the console while this page is open ---
+async function runDeliveryCycle() {
+  if (isSandboxMode || window.__deliveryRunning) return;
+  window.__deliveryRunning = true;
+  const line = document.getElementById('deliveryStatusLine');
+  try {
+    const summary = await drainOutboxOnce(window.DuneAddon.request);
+    const time = new Date().toLocaleTimeString();
+    let text = `Delivery: active while this page is open. Last check ${time}`;
+    if (summary.handedOver > 0) text += `, ${summary.handedOver} handed to the console`;
+    if (summary.skipped.length > 0) text += `, ${summary.skipped.length} rejected as invalid`;
+    if (summary.stoppedBy) text += `. Paused: ${summary.stoppedBy}`;
+    if (line) line.textContent = `${text}.`;
+    if (summary.handedOver > 0 || summary.skipped.length > 0) fetchPendingAirdrops();
+  } catch (err) {
+    if (line) line.textContent = `Delivery paused: ${err.message || err}`;
+  } finally {
+    window.__deliveryRunning = false;
+  }
+}
+
+// --- Upgrade report: rewards imported from earlier versions ---
+async function loadMigrationReport() {
+  const panel = document.getElementById('migrationReport');
+  if (!panel || isSandboxMode) return;
+  try {
+    const counts = await window.DuneAddon.request("database.query", {
+      query: `SELECT count(*) FILTER (WHERE state = 'held')::int AS held,
+                     count(*) FILTER (WHERE state = 'review')::int AS review
+                FROM dune_airdrop.airdrop_reward_queue`
+    });
+    const manual = await window.DuneAddon.request("database.query", {
+      query: `SELECT detail FROM dune_airdrop.airdrop_migration_log WHERE level = 'manual' ORDER BY id DESC LIMIT 50`
+    });
+    const c = (counts.rows || [])[0] || { held: 0, review: 0 };
+    const steps = (manual.rows || []).map((r) => r.detail);
+    if (!c.held && !c.review && steps.length === 0) {
+      panel.classList.add('hidden');
+      return;
+    }
+    panel.classList.remove('hidden');
+    document.getElementById('migrationSummary').textContent =
+      `The upgrade imported rewards the previous version never confirmed. ${c.held} are held (never attempted). ` +
+      `${c.review} are uncertain (the old daemon may already have delivered them, so delivering again could duplicate). ` +
+      'Nothing imported is delivered until you choose.';
+    document.getElementById('migrationHeldActions').classList.toggle('hidden', !c.held);
+    document.getElementById('migrationReviewActions').classList.toggle('hidden', !c.review);
+    document.getElementById('migrationManualList').innerHTML = steps.length === 0 ? '' :
+      '<div class="py-1.5 text-amber-400">Needs a database administrator:</div>' +
+      steps.map((step) => `<div class="py-1.5 border-b border-slate-900/40 select-all">${escapeHTML(step)}</div>`).join('');
+  } catch (err) {
+    console.error('Failed to load upgrade report:', err);
+  }
+}
+
+function setupMigrationActions() {
+  const act = (id, fromState, toState, prompt) => {
+    const button = document.getElementById(id);
+    if (!button) return;
+    button.addEventListener('click', async () => {
+      if (!window.confirm(prompt)) return;
+      try {
+        await window.DuneAddon.request("database.execute", {
+          query: toState === 'queued' ? releaseQuery(fromState) : discardQuery(fromState)
+        });
+        showToast(toState === 'queued' ? 'Released for delivery.' : 'Discarded.', 'success');
+        await loadMigrationReport();
+        await fetchPendingAirdrops();
+      } catch (err) {
+        showToast(`Failed: ${err.message}`, 'error');
+      }
+    });
+  };
+  act('releaseHeldBtn', 'held', 'queued', 'Deliver every held reward from the previous version?');
+  act('discardHeldBtn', 'held', 'discarded', 'Discard every held reward from the previous version? They will not be delivered.');
+  act('releaseReviewBtn', 'review', 'queued', 'These may already have been delivered by the old daemon. Deliver them anyway and risk duplicates?');
+  act('discardReviewBtn', 'review', 'discarded', 'Discard every uncertain reward from the previous version?');
 }
 
 async function fetchContainers() {
@@ -839,7 +960,7 @@ window.testResetDaily = async function(characterId) {
     const safeCharacterId = String(characterId);
     if (!/^[0-9]+$/.test(safeCharacterId)) throw new Error('Invalid character ID');
     await window.DuneAddon.request("database.execute", {
-      query: `UPDATE dune_airdrop.active_playtime
+      query: `UPDATE dune_airdrop.airdrop_player_progress
               SET last_login_date = NULL, consecutive_days = 0
               WHERE character_id = ${safeCharacterId}::bigint`
     });
@@ -856,7 +977,7 @@ window.testSetWeekly = async function(characterId) {
     if (!/^[0-9]+$/.test(safeCharacterId)) throw new Error('Invalid character ID');
     // 31 in binary is 11111 (5 days)
     await window.DuneAddon.request("database.execute", {
-      query: `UPDATE dune_airdrop.active_playtime
+      query: `UPDATE dune_airdrop.airdrop_player_progress
               SET weekly_login_mask = 31, last_weekly_claimed_at = NULL
               WHERE character_id = ${safeCharacterId}::bigint`
     });

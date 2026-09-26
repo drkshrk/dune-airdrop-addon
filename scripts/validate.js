@@ -13,7 +13,8 @@ const allowedPermissions = new Set([
   "server:restart",
   "files:addon-data",
   "broadcast:send",
-  "admin:grant-items"
+  "admin:grant-items",
+  "rewards:grant"
 ]);
 
 function fail(message) {
@@ -106,10 +107,6 @@ function validateRuntimeFiles() {
   const requiredFiles = [
     "setup_playtime_airdrops.sql",
     "uninstall_playtime_airdrops.sql",
-    "daemon/package.json",
-    "daemon/package-lock.json",
-    "daemon/index.js",
-    "daemon/databaseConfig.js",
     "scripts/create_zip.py"
   ];
   for (const relativePath of requiredFiles) {
